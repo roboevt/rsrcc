@@ -312,8 +312,11 @@ void setupAsm() {
     emit("STACK: .dw " + std::to_string(stackSize/4));
     emit(".org 0");
     emit("la r" + rsp + ", STACK");
+    emit("la r" + rret + ", func1");
+    emit("br r" + rret);
 
-    symTab["main"];  // Start register allocation at 2
+    symTab["unused1"];  // Start register allocation at 3
+    symTab["unused2"];
 }
 
 auto main(int argc, const char** argv) -> int {
