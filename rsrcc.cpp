@@ -73,6 +73,22 @@ std::vector<CXCursor> getParams(CXCursor cursor) {
     return params;
 }
 
+std::vector<CXCursor> getArgs(CXCursor cursor) {
+    auto children = getChildren(cursor);
+    std::vector<CXCursor> args(children.begin() + 1, children.end());
+    return args;
+}
+
+std::vector<CXCursor> getBody(CXCursor cursor) {
+    std::vector<CXCursor> body;
+    for (auto child : getChildren(cursor)) {
+        if (clang_getCursorKind(child) != CXCursor_ParmDecl) {
+            body.push_back(child);
+        }
+    }
+    return body;
+}
+
 std::string getBinaryOperator(CXCursor cursor) {
     CXSourceRange range = clang_getCursorExtent(cursor);
     CXToken* tokens = nullptr;
@@ -144,7 +160,7 @@ void visitFunctionDecl(CXCursor cursor) {
     sym.label = "func" + std::to_string(labelNum++);
     symTab[nameStr] = sym;
 
-    emit(sym.label + ":");
+    emit(sym.label + ": ;" + nameStr);
 
     // print params
     // std::cout << "params: ";
@@ -155,7 +171,7 @@ void visitFunctionDecl(CXCursor cursor) {
     // std::cout << std::endl;
 
     // visit body
-    for (auto child : getChildren(cursor)) {
+    for (auto child : getBody(cursor)) {
         visit(child);
     }
 
@@ -181,6 +197,21 @@ void visitIntegerLiteral(CXCursor cursor) {
     int rscratch = symTab.size();
     emit("addi r" + std::to_string(rscratch) + ", r0, " + std::to_string(value));
     push(rscratch);
+}
+
+void visitDeclRef(CXCursor cursor) {
+    CXString name = clang_getCursorSpelling(cursor);
+    std::string nameStr = clang_getCString(name);
+    clang_disposeString(name);
+
+    SymTabEntry sym = symTab[nameStr];
+
+    if (sym.reg == -1) {
+        std::cerr << "Error: " << nameStr << " not declared" << std::endl;
+        return;
+    }
+
+    push(sym.reg);
 }
 
 void visitAssign(CXCursor cursor) {
@@ -224,16 +255,16 @@ void visitInvoke(CXCursor cursor) {
         return;
     }
 
-    std::vector<CXCursor> params = getParams(cursor);
+    std::vector<CXCursor> args = getArgs(cursor);
 
-    for (auto param : params) {
-        visit(param);
+    for (auto arg : args) {
+        visit(arg);
     }
 
     int rscratch = symTab.size();
 
     emit("la r" + std::to_string(rscratch) + ", " + sym.label);
-    emit("brl r" + rsp + ", r" +
+    emit("brl r" + rret + ", r" +
          std::to_string(rscratch));  // Branch with linkage (TODO multiple calls (recursion))
 }
 
@@ -256,6 +287,12 @@ void visit(CXCursor cursor) {
         visitInvoke(cursor);
     } else if (kind == CXCursor_IntegerLiteral) {
         visitIntegerLiteral(cursor);
+    } else if (kind == CXCursor_DeclRefExpr) {
+        visitDeclRef(cursor);
+    } else {
+        for(auto child : getChildren(cursor)) {
+            visit(child);
+        }
     }
 }
 
@@ -263,9 +300,7 @@ CXChildVisitResult visitor(CXCursor cursor, CXCursor parent, CXClientData client
     int depth = *(int*)clientData;
     int nextDepth = depth + 1;
 
-    // std::cout << std::string(depth, '-') << cursor << std::endl;
-
-    visit(cursor);
+    std::cout << std::string(depth, '-') << cursor << std::endl;
 
     clang_visitChildren(cursor, visitor, &nextDepth);
 
@@ -275,7 +310,10 @@ CXChildVisitResult visitor(CXCursor cursor, CXCursor parent, CXClientData client
 void setupAsm() {
     emit(".org " + std::to_string(stackBegin));
     emit("STACK: .dw " + std::to_string(stackSize/4));
+    emit(".org 0");
     emit("la r" + rsp + ", STACK");
+
+    symTab["main"];  // Start register allocation at 2
 }
 
 auto main(int argc, const char** argv) -> int {
@@ -290,7 +328,6 @@ auto main(int argc, const char** argv) -> int {
         return 1;
     }
 
-    // Perform operations with the translation unit...
 
     CXCursor rootCursor = clang_getTranslationUnitCursor(translationUnit);
 
@@ -298,7 +335,10 @@ auto main(int argc, const char** argv) -> int {
 
     setupAsm();
 
-    clang_visitChildren(rootCursor, visitor, &startingDepth);
+    // clang_visitChildren(rootCursor, visitor, &startingDepth);
+    visit(rootCursor);
+
+    emit("stop");
 
     clang_disposeTranslationUnit(translationUnit);
     clang_disposeIndex(index);
