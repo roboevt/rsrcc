@@ -176,7 +176,10 @@ void visitFunctionDecl(CXCursor cursor) {
     }
 
     // return
-    emit("br r" + rret);  // TODO multiple returns (recursion)
+    
+    // Retrieve the return address from one above the stack pointer
+    emit("ld r" + rret + ", 4(r" + rsp + ")");  // TODO check here if things are broken
+    emit("br r" + rret);
 }
 
 void visitVarDecl(CXCursor cursor) {
@@ -255,7 +258,13 @@ void visitInvoke(CXCursor cursor) {
         return;
     }
 
+    emit("brlnv r" + rret);  // brl never, to save the pc
+
     std::vector<CXCursor> args = getArgs(cursor);
+
+      // Return address is after pushing each arg (pushing/popping are each two instructions + one for call)
+    emit("addi r" + rret + ", r" + rret + ", " + std::to_string(args.size() * 16 + 4));
+    push(2);  // TODO don't hard code rret
 
     for (auto arg : args) {
         visit(arg);
@@ -264,8 +273,7 @@ void visitInvoke(CXCursor cursor) {
     int rscratch = symTab.size();
 
     emit("la r" + std::to_string(rscratch) + ", " + sym.label);
-    emit("brl r" + rret + ", r" +
-         std::to_string(rscratch));  // Branch with linkage (TODO multiple calls (recursion))
+    emit("br r" + std::to_string(rscratch));
 }
 
 void visit(CXCursor cursor) {
@@ -312,7 +320,7 @@ void setupAsm() {
     emit("STACK: .dw " + std::to_string(stackSize/4));
     emit(".org 0");
     emit("la r" + rsp + ", STACK");
-    emit("la r" + rret + ", func1");
+    emit("la r" + rret + ", func1");  // Entry point
     emit("br r" + rret);
 
     symTab["unused1"];  // Start register allocation at 3
