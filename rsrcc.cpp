@@ -4,34 +4,53 @@
 
 #include <unordered_map>
 
-static const std::string rsp = "1";
-static const std::string rret = "2";
+static const std::string esp = "1";
+static const std::string ebp = "2";
+static const std::string eax = "3";
+
+static constexpr int RESERVED_REGS = 3;
 
 static constexpr int stackBegin = 4096;
 static constexpr int stackSize = 4096;
 static constexpr int MAX_REGS = 31;
 
-struct SymTabEntry {
-    int reg;
+static const std::string ENTRY_POINT = "main";
 
-    enum class Kind { var, func, invalid } kind;
-
-    std::string label;
-
-    SymTabEntry() : reg(-1), kind(Kind::invalid) {}
-};
-
-class ScratchReg {
+class Register {
     static int nextReg;
     int reg;
 
    public:
-    ScratchReg() : reg(nextReg--) {}
+    Register() : reg(nextReg--) {}
+    Register(const Register& other) : reg(other.reg) {}
+    // Register(int reg) : reg(reg) {}
+    Register& operator=(const Register& other)  = delete;
+    Register& operator=(const Register&& other) = delete;
     operator int() const { return reg; }
-    ~ScratchReg() { nextReg++; }
+    ~Register() { nextReg++; }
 };
 
-int ScratchReg::nextReg = MAX_REGS;
+int Register::nextReg = MAX_REGS;
+
+struct SymTabEntry {
+    int offset;  //  negative offset from ebp for locals, posotive from ebp for params, and next available offset for params for func (ugly I know, TODO fix)
+    // param1 
+    // param2
+    // param3
+    // return address
+    // saved previous ebp  <- ebp
+    // local1
+    // local2
+    // local3 <- esp
+    
+    Register reg;
+
+    enum class Kind { local, param, func, invalid } kind;
+
+    std::string label;
+
+    SymTabEntry() : reg(), offset(-1), kind(Kind::invalid) {}
+};
 
 static std::unordered_map<std::string, SymTabEntry> symTab;
 
@@ -58,6 +77,7 @@ std::ostream& operator<<(std::ostream& stream, const CXCursor& cursor) {
         case CXCursor_VarDecl:
         case CXCursor_ParmDecl:
         case CXCursor_DeclRefExpr:
+        case CXCursor_UnexposedExpr:
             stream << getSymbolName(cursor);
             break;
         default:
@@ -80,6 +100,19 @@ std::vector<CXCursor> getChildren(CXCursor cursor) {
         },
         &children);
     return children;
+}
+
+std::vector<CXCursor> getDescendants(CXCursor cursor) {
+    std::vector<CXCursor> descendants;
+    clang_visitChildren(
+        cursor,
+        [](CXCursor cursor, CXCursor parent, CXClientData clientData) {
+            std::vector<CXCursor>* descendants = (std::vector<CXCursor>*)clientData;
+            descendants->push_back(cursor);
+            return CXChildVisit_Recurse;
+        },
+        &descendants);
+    return descendants;
 }
 
 std::vector<CXCursor> getParams(CXCursor cursor) {
@@ -142,6 +175,27 @@ std::string getBinaryOperator(CXCursor cursor) {
     return "";
 }
 
+std::vector<CXCursor> getBinaryOperands(CXCursor cursor) {
+    std::vector<CXCursor> operands;
+    for (auto child : getChildren(cursor)) {
+        while (clang_isUnexposed(child.kind)) {
+            child = getChildren(child).at(0);
+        }
+        operands.push_back(child);
+    }
+    return operands;
+}
+
+std::vector<CXCursor> getLocalVars(CXCursor cursor) {
+    std::vector<CXCursor> vars;
+    for (auto child : getDescendants(cursor)) {
+        if (clang_getCursorKind(child) == CXCursor_VarDecl) {
+            vars.push_back(child);
+        }
+    }
+    return vars;
+}
+
 int getIntegerLiteral(CXCursor cursor) {
     CXSourceRange range = clang_getCursorExtent(cursor);
     CXToken* tokens = nullptr;
@@ -185,105 +239,137 @@ std::string getSymbolName(CXCursor cursor) {
     return parentName + "::" + varName;
 }
 
-std::string getScratchReg() {
-    static int scratchReg = MAX_REGS;
-    return std::to_string(scratchReg--);
-}
-
 /// @brief Pushes the value in the given register onto the stack (stack grows downwards)
 /// @param reg The register to push
 void push(int reg) {
-    emit("addi r" + rsp + ", r" + rsp + ", -4");
-    emit("st r" + std::to_string(reg) + ", 0(r" + rsp + ") ; push");
+    emit("addi r" + esp + ", r" + esp + ", -4");
+    emit("st r" + std::to_string(reg) + ", 0(r" + esp + ") ; push");
 }
 
 /// @brief Pops the top value off the stack into the given register (stack grows downwards)
 /// @param reg The register to pop into
 void pop(int reg) {
-    emit("ld r" + std::to_string(reg) + ", 0(r" + rsp + ") ; pop");
-    emit("addi r" + rsp + ", r" + rsp + ", 4");
+    emit("ld r" + std::to_string(reg) + ", 0(r" + esp + ") ; pop");
+    emit("addi r" + esp + ", r" + esp + ", 4");
     // clear stack
-    ScratchReg reg1;
+    Register reg1;
     emit("la r" + std::to_string(reg1) + ", 0");
-    emit("st r" + std::to_string(reg1) + ", -4(r" + rsp + ")");
+    emit("st r" + std::to_string(reg1) + ", -4(r" + esp + ")");
 }
 
 void pop(std::string reg) { pop(std::stoi(reg)); }
 
 void push(std::string reg) { push(std::stoi(reg)); }
 
+void call(std::string funcName) {
+    Register reg;
+    emit("brlnv r" + std::to_string(reg));
+    emit("addi r" + std::to_string(reg) + ", r" + std::to_string(reg) + ", 20");  // Account for return address + instructions
+    push(reg);  // Push return address
+    emit("la r" + std::to_string(reg) + ", " + symTab[funcName].label);
+    emit("br r" + std::to_string(reg) + " ; call " + funcName);
+}
+
+void ret() {
+    Register reg;
+    pop(reg);
+    emit("br r" + std::to_string(reg) + " ; ret");
+}
+
 void iadd() {
     // pop top two operands off stack and add them, then push
-    ScratchReg reg1, reg2;
+    Register reg1, reg2;
     pop(reg1);
     pop(reg2);
     // TODO hard code stack offsets instead of using pop()
 
-    emit("add r" + std::to_string(reg1) + ", r" + std::to_string(reg1) + ", r" + std::to_string(reg2));
+    emit("add r" + std::to_string(reg1) + ", r" + std::to_string(reg1) + ", r" +
+         std::to_string(reg2));
     push(reg1);
 }
 
 void isub() {
     // pop top two operands off stack and add them, then push
-    ScratchReg reg1, reg2;
+    Register reg1, reg2;
     pop(reg1);  // TODO hard code stack offsets instead of using pop()
     pop(reg2);
-    emit("sub r" + std::to_string(reg1) + ", r" + std::to_string(reg1) + ", r" + std::to_string(reg2));
+    emit("sub r" + std::to_string(reg1) + ", r" + std::to_string(reg1) + ", r" +
+         std::to_string(reg2));
     push(reg1);
 }
 
 void ineg() {
-    ScratchReg reg;
+    Register reg;
     pop(reg);
     emit("neg r" + std::to_string(reg) + ", r" + std::to_string(reg));
 }
 
 void ior() {
-    ScratchReg reg1, reg2;
+    Register reg1, reg2;
     pop(reg1);
     pop(reg2);
-    emit("or r" + std::to_string(reg1) + ", r" + std::to_string(reg1) + ", r" + std::to_string(reg2));
+    emit("or r" + std::to_string(reg1) + ", r" + std::to_string(reg1) + ", r" +
+         std::to_string(reg2));
     push(reg1);
 }
 
 void iand() {
-    ScratchReg reg1, reg2;
+    Register reg1, reg2;
     pop(reg1);
     pop(reg2);
-    emit("and r" + std::to_string(reg1) + ", r" + std::to_string(reg1) + ", r" + std::to_string(reg2));
+    emit("and r" + std::to_string(reg1) + ", r" + std::to_string(reg1) + ", r" +
+         std::to_string(reg2));
     push(reg1);
 }
 
 void inot() {
-    ScratchReg reg;
+    Register reg;
     pop(reg);
     emit("not r" + std::to_string(reg) + ", r" + std::to_string(reg));
     push(reg);
 }
 
+void add2(SymTabEntry sym1, SymTabEntry sym2) {
+    if(sym1.kind == SymTabEntry::Kind::param) {
+        emit("ld r" + std::to_string(sym1.reg) + ", " + std::to_string(sym1.offset) + "(r" + ebp + ")");
+    } else if(sym1.kind == SymTabEntry::Kind::local){
+        emit("ld r" + std::to_string(sym1.reg) + ", -" + std::to_string(sym1.offset) + "(r" + ebp + ")");
+    } 
+    if(sym2.kind == SymTabEntry::Kind::param) {
+        emit("ld r" + std::to_string(sym2.reg) + ", " + std::to_string(sym2.offset) + "(r" + ebp + ")");
+    } else if(sym2.kind == SymTabEntry::Kind::local){
+        emit("ld r" + std::to_string(sym2.reg) + ", -" + std::to_string(sym2.offset) + "(r" + ebp + ")");
+    }
+
+    emit("add r" + eax + ", r" + std::to_string(sym1.reg) + ", r" + std::to_string(sym2.reg) + " ; add ");
+}
+
 void visitCompute(CXCursor cursor) {
     if (cursor.kind == CXCursor_BinaryOperator) {
         std::string op = getBinaryOperator(cursor);
+        std::vector<CXCursor> operands = getBinaryOperands(cursor);
+        std::string lhsNameStr = getSymbolName(operands.at(0));
+        std::string rhsNameStr = getSymbolName(operands.at(1));
         if (op == "+") {
-            iadd();
-        } else if (op == "-") {
-            isub();
-        } else if (op == "|") {
-            ior();
-        } else if (op == "&") {
-            iand();
+            add2(symTab[lhsNameStr], symTab[rhsNameStr]);
+            // } else if (op == "-") {
+            //     isub();
+            // } else if (op == "|") {
+            //     ior();
+            // } else if (op == "&") {
+            //     iand();
         } else {
             std::cerr << "Error: Unknown Binary Operator " << op << std::endl;
         }
-    } else if (cursor.kind == CXCursor_UnaryOperator) {
-        std::string op = getBinaryOperator(cursor);
-        if (op == "-") {
-            ineg();
-        } else if (op == "~") {
-            inot();
-        } else {
-            std::cerr << "Error: Unknown Unary Operator " << op << std::endl;
-        }
+        // } else if (cursor.kind == CXCursor_UnaryOperator) {
+        //     std::string op = getBinaryOperator(cursor);
+        //     if (op == "-") {
+        //         ineg();
+        //     } else if (op == "~") {
+        //         inot();
+        //     } else {
+        //         std::cerr << "Error: Unknown Unary Operator " << op << std::endl;
+        //     }
     } else {
         std::cerr << "Error: Unknown Compute Operator " << cursor << std::endl;
     }
@@ -292,60 +378,69 @@ void visitCompute(CXCursor cursor) {
 void visitFunctionDecl(CXCursor cursor) {
     // get params
     std::vector<CXCursor> params = getParams(cursor);
-
-    for (auto param : params) {
-        visitVarDecl(param);
-    }
+    std::vector<CXCursor> locals = getLocalVars(cursor);
 
     std::string funcName = getSymbolName(cursor);
 
-    SymTabEntry sym = symTab[funcName];
+    SymTabEntry& sym = symTab[funcName];
     sym.kind = SymTabEntry::Kind::func;
     sym.label = "func" + std::to_string(labelNum++);
-    symTab[funcName] = sym;
+    sym.offset = locals.size() - 1;  // TODO hacky
 
     emit(sym.label + ": ; " + funcName);
 
-    // print params
-    // std::cout << "params: ";
-    // for (auto param : params) {
-    //     std::cout << param << " ";
-    //     visitVarDecl(param);
-    // }
-    // std::cout << std::endl;
+    int requiredStack = (params.size() + locals.size()) * 4;
+
+    // Prologue
+    push(ebp);
+    emit("addi r" + ebp + ", r" + esp + ", 0");  // ebp = esp
+    // Allcate space for locals (assuming 4 bytes each)
+    emit("addi r" + esp + ", r" + esp + ", -" + std::to_string(requiredStack));
+
+    // visit params
+    for (int i = 0; i < params.size(); i++) {
+        std::string nameStr = getSymbolName(params[i]);
+        SymTabEntry& sym = symTab[nameStr];
+        sym.offset = (i + 2) * 4;  // TODO hacky
+        sym.kind = SymTabEntry::Kind::param;
+        // emit("st r" + std::to_string(i + RESERVED_REGS) + ", " + std::to_string(sym.offset) + "(r" +
+        //      ebp + ")");
+
+        visit(params[i]);
+    }
 
     // visit body
     for (auto child : getBody(cursor)) {
         visit(child);
     }
 
-    // return
-    ScratchReg reg;
-
-    // Retrieve the return address from one above the stack pointer
-    pop(reg);
-    pop(rret);
-    push(reg);
-    emit("br r" + rret + " ; return");
+    // return epilogue
+    emit("addi r" + esp + ", r" + ebp + ", 0");  // esp = ebp
+    pop(ebp);
+    ret();
 }
 
 void visitVarDecl(CXCursor cursor) {
     std::string nameStr = getSymbolName(cursor);
 
-    SymTabEntry sym = symTab[nameStr];
+    SymTabEntry& sym = symTab[nameStr];
 
-    if (sym.reg == -1) {
-        sym.reg = symTab.size();
-        symTab[nameStr] = sym;
-        // std::cout << ";alloc " << nameStr << " to r" << sym.reg << std::endl;
+    if (sym.offset == -1) {  // Not yet allocated
+        // Calculate offset
+        CXCursor parent = clang_getCursorSemanticParent(cursor);
+        SymTabEntry& parentSym = symTab[getSymbolName(parent)];
+        sym.offset = parentSym.offset * 4;
+        parentSym.offset--;
+
+        sym.kind = SymTabEntry::Kind::local;
+
+        std::cout << ";alloc " << nameStr << " to offset" << sym.offset << std::endl;
     }
 }
 
 void visitIntegerLiteral(CXCursor cursor) {
     int value = getIntegerLiteral(cursor);
-    ScratchReg reg;
-    emit("la r" + std::to_string(reg) + ", " + std::to_string(value));
-    push(reg);
+    emit("la r" + eax + ", " + std::to_string(value));
 }
 
 void visitDeclRef(CXCursor cursor) {
@@ -358,7 +453,13 @@ void visitDeclRef(CXCursor cursor) {
         return;
     }
 
-    push(sym.reg);
+    if(sym.kind == SymTabEntry::Kind::param) {
+        emit("ld r" + eax + ", " + std::to_string(sym.offset) + "(r" + ebp + ") ; " + nameStr);
+    } else if(sym.kind == SymTabEntry::Kind::local){
+        emit("ld r" + eax + ", -" + std::to_string(sym.offset) + "(r" + ebp + ") ; " + nameStr);
+    } else {
+        std::cerr << "Error: " << nameStr << " not a local or param" << std::endl;
+    }
 }
 
 void visitAssign(CXCursor cursor) {
@@ -375,10 +476,9 @@ void visitAssign(CXCursor cursor) {
         return;
     }
 
-    visit(rhs);
+    visit(rhs);  // Puts result in eax
 
-    // Now we should have RHS on the stack.
-    pop(lhsSym.reg);
+    emit("st r" + eax + ", -" + std::to_string(lhsSym.offset) + "(r" + ebp + ") ; " + lhsNameStr);
 }
 
 void visitInvoke(CXCursor cursor) {
@@ -390,23 +490,14 @@ void visitInvoke(CXCursor cursor) {
         return;
     }
 
-    emit("brlnv r" + rret);  // brl never, to save the pc
-
     std::vector<CXCursor> args = getArgs(cursor);
-
-    // Return address is after pushing each arg (pushing/popping are each two instructions + one for
-    // call)
-    emit("addi r" + rret + ", r" + rret + ", " + std::to_string(args.size() * 16 + 4));
-    push(2);  // TODO don't hard code rret
 
     for (auto arg : args) {
         visit(arg);
+        push(eax);
     }
 
-    ScratchReg reg;
-
-    emit("la r" + std::to_string(reg) + ", " + sym.label);
-    emit("br r" + std::to_string(reg) + " ; " + "call " + nameStr);
+    call(nameStr);
 }
 
 void visit(CXCursor cursor) {
@@ -449,17 +540,25 @@ CXChildVisitResult printVisitor(CXCursor cursor, CXCursor parent, CXClientData c
 }
 
 void setupAsm() {
+    // Setup stack
     emit(".org " + std::to_string(stackBegin));
     emit("STACK: .dw " + std::to_string(stackSize / 4));
     emit(".org 0");
-    emit("la r" + rsp + ", STACK");
-    emit("la r" + rret + ", END ; main exit");
-    push(rret);
-    emit("la r" + rret + ", func6 ; main entry");  // TODO search symtab for main
-    emit("br r" + rret);
+    emit("la r" + esp + ", STACK");
+    emit("la r" + ebp + ", STACK");
 
-    symTab["unused1"];  // Start register allocation at 3
-    symTab["unused2"];
+    // Create main stack frame
+    Register reg;
+    emit("la r" + std::to_string(reg) + ", END ; main exit");
+    push(reg);  // Push return address
+    SymTabEntry sym = symTab[ENTRY_POINT];
+    emit("la r" + std::to_string(reg) + ", " + "func1");  // TODO: fix this
+    emit("br r" + std::to_string(reg) + " ; call " + ENTRY_POINT);
+
+    for(int i = 0; i < RESERVED_REGS; i++) {
+        symTab["unused" + std::to_string(i)]; // Reserve registers, needed?
+    }
+
 }
 
 auto main(int argc, const char** argv) -> int {
@@ -492,10 +591,11 @@ auto main(int argc, const char** argv) -> int {
 
     visit(rootCursor);
 
+    Register reg;
     emit("stop");
-    emit("la r" + rret + ", END");
+    emit("la r" + std::to_string(reg) + ", END");
     emit("END:");
-    emit("br r" + rret);  // End in infinite loop
+    emit("br r" + std::to_string(reg));  // End in infinite loop
 
     clang_disposeTranslationUnit(translationUnit);
     clang_disposeIndex(index);

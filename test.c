@@ -2,32 +2,33 @@ int sum(int x, int y) {
 	return x + y;
 }
 
-int sub(int x, int y) {
-	return x - y;
-}
+// int sub(int x, int y) {
+// 	return x - y;
+// }
 
-int neg(int x) {
-	return -x;
-}
+// int neg(int x) {
+// 	return -x;
+// }
 
-int or(int x, int y) {
-	return x | y;
-}
+// int or(int x, int y) {
+// 	return x | y;
+// }
 
-int not(int x) {
-	return ~x;
-}
+// int not(int x) {
+// 	return ~x;
+// }
 
-int and(int x, int y) {
-	return x & y;
-}
+// int and(int x, int y) {
+// 	return x & y;
+// }
+
 
 int main() {
 	int a;
-	int b, c;
+	int b, c, d;
 	a = 32;
 	b = 399;
-	c = sum(a,b);
+	c = sum(a, b);
 	return c;
 }
 

@@ -18,6 +18,8 @@ std::string getUnaryOperator(CXCursor cursor);
 
 std::string getBinaryOperator(CXCursor cursor);
 
+std::vector<CXCursor> getBinaryOperands(CXCursor cursor);
+
 std::string getSymbolName(CXCursor cursor);
 
 int getIntegerLiteral(CXCursor cursor);
