@@ -25,8 +25,8 @@ int and(int x, int y) {
 int main() {
 	int a;
 	int b, c;
-	a = 31;
-	b = 400;
+	a = 32;
+	b = 399;
 	c = sum(a,b);
 	return c;
 }

@@ -28,8 +28,6 @@ class ScratchReg {
    public:
     ScratchReg() : reg(nextReg--) {}
     operator int() const { return reg; }
-    operator std::string() const { return std::to_string(reg); }
-    std::string operator+(const char* str) const { return std::to_string(reg) + std::string(str); }
     ~ScratchReg() { nextReg++; }
 };
 
@@ -210,6 +208,10 @@ void pop(int reg) {
     emit("st r" + std::to_string(reg1) + ", -4(r" + rsp + ")");
 }
 
+void pop(std::string reg) { pop(std::stoi(reg)); }
+
+void push(std::string reg) { push(std::stoi(reg)); }
+
 void iadd() {
     // pop top two operands off stack and add them, then push
     ScratchReg reg1, reg2;
@@ -318,10 +320,12 @@ void visitFunctionDecl(CXCursor cursor) {
     }
 
     // return
+    ScratchReg reg;
 
     // Retrieve the return address from one above the stack pointer
-    emit("ld r" + rret + ", 4(r" + rsp + ")");
-    // emit("addi r" + rsp + ", r" + rsp + ", 4");
+    pop(reg);
+    pop(rret);
+    push(reg);
     emit("br r" + rret + " ; return");
 }
 
@@ -450,7 +454,7 @@ void setupAsm() {
     emit(".org 0");
     emit("la r" + rsp + ", STACK");
     emit("la r" + rret + ", END ; main exit");
-    push(stoi(rret));
+    push(rret);
     emit("la r" + rret + ", func6 ; main entry");  // TODO search symtab for main
     emit("br r" + rret);
 
