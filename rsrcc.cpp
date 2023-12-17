@@ -9,6 +9,7 @@ static const std::string rret = "2";
 
 static constexpr int stackBegin = 4096;
 static constexpr int stackSize = 4096;
+static constexpr int MAX_REGS = 31;
 
 struct SymTabEntry {
     int reg;
@@ -19,6 +20,20 @@ struct SymTabEntry {
 
     SymTabEntry() : reg(-1), kind(Kind::invalid) {}
 };
+
+class ScratchReg {
+    static int nextReg;
+    int reg;
+
+   public:
+    ScratchReg() : reg(nextReg--) {}
+    operator int() const { return reg; }
+    operator std::string() const { return std::to_string(reg); }
+    std::string operator+(const char* str) const { return std::to_string(reg) + std::string(str); }
+    ~ScratchReg() { nextReg++; }
+};
+
+int ScratchReg::nextReg = MAX_REGS;
 
 static std::unordered_map<std::string, SymTabEntry> symTab;
 
@@ -33,16 +48,22 @@ std::ostream& operator<<(std::ostream& stream, const CXString& str) {
 std::ostream& operator<<(std::ostream& stream, const CXCursor& cursor) {
     stream << clang_getCursorKindSpelling(clang_getCursorKind(cursor)) << " <";
     switch (cursor.kind) {
-        case CXCursor_BinaryOperator: {
+        case CXCursor_UnaryOperator:
+            stream << getUnaryOperator(cursor);
+            break;
+        case CXCursor_BinaryOperator:
             stream << getBinaryOperator(cursor);
             break;
-        case CXCursor_IntegerLiteral: {
-                stream << getIntegerLiteral(cursor);
-                break;
-                default:
-                    stream << clang_getCursorSpelling(cursor);
-            }
-        }
+        case CXCursor_IntegerLiteral:
+            stream << getIntegerLiteral(cursor);
+            break;
+        case CXCursor_VarDecl:
+        case CXCursor_ParmDecl:
+        case CXCursor_DeclRefExpr:
+            stream << getSymbolName(cursor);
+            break;
+        default:
+            stream << clang_getCursorSpelling(cursor);
     }
     stream << ">";
     return stream;
@@ -89,6 +110,23 @@ std::vector<CXCursor> getBody(CXCursor cursor) {
     return body;
 }
 
+std::string getUnaryOperator(CXCursor cursor) {
+    CXSourceRange range = clang_getCursorExtent(cursor);
+    CXToken* tokens = nullptr;
+    unsigned int numTokens = 0;
+    CXTranslationUnit TU = clang_Cursor_getTranslationUnit(cursor);
+    clang_tokenize(TU, range, &tokens, &numTokens);
+    if (numTokens > 0) {
+        CXString tokenSpelling = clang_getTokenSpelling(TU, tokens[0]);
+        std::string op = clang_getCString(tokenSpelling);
+        clang_disposeString(tokenSpelling);
+        clang_disposeTokens(TU, tokens, numTokens);
+        return op;
+    }
+    clang_disposeTokens(TU, tokens, numTokens);
+    return "";
+}
+
 std::string getBinaryOperator(CXCursor cursor) {
     CXSourceRange range = clang_getCursorExtent(cursor);
     CXToken* tokens = nullptr;
@@ -123,44 +161,148 @@ int getIntegerLiteral(CXCursor cursor) {
     return 0;
 }
 
+std::string getSymbolName(CXCursor cursor) {
+    if (cursor.kind == CXCursor_DeclRefExpr) {
+        CXCursor definition = clang_getCursorDefinition(cursor);
+        return getSymbolName(definition);
+    }
+    if (cursor.kind == CXCursor_FunctionDecl) {
+        CXString funcName = clang_getCursorSpelling(cursor);
+        std::string funcNameStr = clang_getCString(funcName);
+        clang_disposeString(funcName);
+        return funcNameStr;
+    } else if (cursor.kind == CXCursor_CallExpr) {
+        CXCursor definition = clang_getCursorDefinition(cursor);
+        return getSymbolName(definition);
+    }
+    CXString name = clang_getCursorSpelling(cursor);
+    std::string varName = clang_getCString(name);
+    clang_disposeString(name);
+
+    CXCursor parent = clang_getCursorSemanticParent(cursor);
+    CXString pname = clang_getCursorSpelling(parent);
+    std::string parentName = clang_getCString(pname);
+    clang_disposeString(pname);
+
+    return parentName + "::" + varName;
+}
+
+std::string getScratchReg() {
+    static int scratchReg = MAX_REGS;
+    return std::to_string(scratchReg--);
+}
+
 /// @brief Pushes the value in the given register onto the stack (stack grows downwards)
 /// @param reg The register to push
 void push(int reg) {
     emit("addi r" + rsp + ", r" + rsp + ", -4");
-    emit("st r" + std::to_string(reg) + ", 0(r" + rsp + ")");
+    emit("st r" + std::to_string(reg) + ", 0(r" + rsp + ") ; push");
 }
 
 /// @brief Pops the top value off the stack into the given register (stack grows downwards)
 /// @param reg The register to pop into
 void pop(int reg) {
-    emit("ld r" + std::to_string(reg) + ", 0(r" + rsp + ")");
+    emit("ld r" + std::to_string(reg) + ", 0(r" + rsp + ") ; pop");
     emit("addi r" + rsp + ", r" + rsp + ", 4");
+    // clear stack
+    ScratchReg reg1;
+    emit("la r" + std::to_string(reg1) + ", 0");
+    emit("st r" + std::to_string(reg1) + ", -4(r" + rsp + ")");
 }
 
 void iadd() {
     // pop top two operands off stack and add them, then push
-    int rscratch = symTab.size();
-    pop(rscratch);  // TODO hard code stack offsets instead of using pop()
-    pop(rscratch + 1);
-    emit("add r" + std::to_string(rscratch) + ", r" + std::to_string(rscratch) + ", r" +
-         std::to_string(rscratch + 1));
-    push(rscratch);
+    ScratchReg reg1, reg2;
+    pop(reg1);
+    pop(reg2);
+    // TODO hard code stack offsets instead of using pop()
+
+    emit("add r" + std::to_string(reg1) + ", r" + std::to_string(reg1) + ", r" + std::to_string(reg2));
+    push(reg1);
+}
+
+void isub() {
+    // pop top two operands off stack and add them, then push
+    ScratchReg reg1, reg2;
+    pop(reg1);  // TODO hard code stack offsets instead of using pop()
+    pop(reg2);
+    emit("sub r" + std::to_string(reg1) + ", r" + std::to_string(reg1) + ", r" + std::to_string(reg2));
+    push(reg1);
+}
+
+void ineg() {
+    ScratchReg reg;
+    pop(reg);
+    emit("neg r" + std::to_string(reg) + ", r" + std::to_string(reg));
+}
+
+void ior() {
+    ScratchReg reg1, reg2;
+    pop(reg1);
+    pop(reg2);
+    emit("or r" + std::to_string(reg1) + ", r" + std::to_string(reg1) + ", r" + std::to_string(reg2));
+    push(reg1);
+}
+
+void iand() {
+    ScratchReg reg1, reg2;
+    pop(reg1);
+    pop(reg2);
+    emit("and r" + std::to_string(reg1) + ", r" + std::to_string(reg1) + ", r" + std::to_string(reg2));
+    push(reg1);
+}
+
+void inot() {
+    ScratchReg reg;
+    pop(reg);
+    emit("not r" + std::to_string(reg) + ", r" + std::to_string(reg));
+    push(reg);
+}
+
+void visitCompute(CXCursor cursor) {
+    if (cursor.kind == CXCursor_BinaryOperator) {
+        std::string op = getBinaryOperator(cursor);
+        if (op == "+") {
+            iadd();
+        } else if (op == "-") {
+            isub();
+        } else if (op == "|") {
+            ior();
+        } else if (op == "&") {
+            iand();
+        } else {
+            std::cerr << "Error: Unknown Binary Operator " << op << std::endl;
+        }
+    } else if (cursor.kind == CXCursor_UnaryOperator) {
+        std::string op = getBinaryOperator(cursor);
+        if (op == "-") {
+            ineg();
+        } else if (op == "~") {
+            inot();
+        } else {
+            std::cerr << "Error: Unknown Unary Operator " << op << std::endl;
+        }
+    } else {
+        std::cerr << "Error: Unknown Compute Operator " << cursor << std::endl;
+    }
 }
 
 void visitFunctionDecl(CXCursor cursor) {
     // get params
     std::vector<CXCursor> params = getParams(cursor);
 
-    CXString name = clang_getCursorSpelling(cursor);
-    std::string nameStr = clang_getCString(name);
-    clang_disposeString(name);
+    for (auto param : params) {
+        visitVarDecl(param);
+    }
 
-    SymTabEntry sym = symTab[nameStr];
+    std::string funcName = getSymbolName(cursor);
+
+    SymTabEntry sym = symTab[funcName];
     sym.kind = SymTabEntry::Kind::func;
     sym.label = "func" + std::to_string(labelNum++);
-    symTab[nameStr] = sym;
+    symTab[funcName] = sym;
 
-    emit(sym.label + ": ;" + nameStr);
+    emit(sym.label + ": ; " + funcName);
 
     // print params
     // std::cout << "params: ";
@@ -176,36 +318,34 @@ void visitFunctionDecl(CXCursor cursor) {
     }
 
     // return
-    
+
     // Retrieve the return address from one above the stack pointer
-    emit("ld r" + rret + ", 4(r" + rsp + ")");  // TODO check here if things are broken
-    emit("br r" + rret);
+    emit("ld r" + rret + ", 4(r" + rsp + ")");
+    // emit("addi r" + rsp + ", r" + rsp + ", 4");
+    emit("br r" + rret + " ; return");
 }
 
 void visitVarDecl(CXCursor cursor) {
-    CXString name = clang_getCursorSpelling(cursor);
-    std::string nameStr = clang_getCString(name);
-    clang_disposeString(name);
+    std::string nameStr = getSymbolName(cursor);
 
     SymTabEntry sym = symTab[nameStr];
 
     if (sym.reg == -1) {
         sym.reg = symTab.size();
         symTab[nameStr] = sym;
+        // std::cout << ";alloc " << nameStr << " to r" << sym.reg << std::endl;
     }
 }
 
 void visitIntegerLiteral(CXCursor cursor) {
     int value = getIntegerLiteral(cursor);
-    int rscratch = symTab.size();
-    emit("addi r" + std::to_string(rscratch) + ", r0, " + std::to_string(value));
-    push(rscratch);
+    ScratchReg reg;
+    emit("la r" + std::to_string(reg) + ", " + std::to_string(value));
+    push(reg);
 }
 
 void visitDeclRef(CXCursor cursor) {
-    CXString name = clang_getCursorSpelling(cursor);
-    std::string nameStr = clang_getCString(name);
-    clang_disposeString(name);
+    std::string nameStr = getSymbolName(cursor);
 
     SymTabEntry sym = symTab[nameStr];
 
@@ -222,9 +362,7 @@ void visitAssign(CXCursor cursor) {
     CXCursor lhs = children.at(0);
     CXCursor rhs = children.at(1);
 
-    CXString lhsName = clang_getCursorSpelling(lhs);
-    std::string lhsNameStr = clang_getCString(lhsName);
-    clang_disposeString(lhsName);
+    std::string lhsNameStr = getSymbolName(lhs);
 
     SymTabEntry lhsSym = symTab[lhsNameStr];
 
@@ -239,18 +377,8 @@ void visitAssign(CXCursor cursor) {
     pop(lhsSym.reg);
 }
 
-void visitCompute(CXCursor cursor) {
-    std::string op = getBinaryOperator(cursor);
-    if (op == "+") {
-        iadd();
-    }
-}
-
 void visitInvoke(CXCursor cursor) {
-    CXString name = clang_getCursorSpelling(cursor);
-    std::string nameStr = clang_getCString(name);
-    clang_disposeString(name);
-
+    std::string nameStr = getSymbolName(cursor);
     SymTabEntry sym = symTab[nameStr];
 
     if (sym.label == "") {
@@ -262,7 +390,8 @@ void visitInvoke(CXCursor cursor) {
 
     std::vector<CXCursor> args = getArgs(cursor);
 
-      // Return address is after pushing each arg (pushing/popping are each two instructions + one for call)
+    // Return address is after pushing each arg (pushing/popping are each two instructions + one for
+    // call)
     emit("addi r" + rret + ", r" + rret + ", " + std::to_string(args.size() * 16 + 4));
     push(2);  // TODO don't hard code rret
 
@@ -270,10 +399,10 @@ void visitInvoke(CXCursor cursor) {
         visit(arg);
     }
 
-    int rscratch = symTab.size();
+    ScratchReg reg;
 
-    emit("la r" + std::to_string(rscratch) + ", " + sym.label);
-    emit("br r" + std::to_string(rscratch));
+    emit("la r" + std::to_string(reg) + ", " + sym.label);
+    emit("br r" + std::to_string(reg) + " ; " + "call " + nameStr);
 }
 
 void visit(CXCursor cursor) {
@@ -298,29 +427,31 @@ void visit(CXCursor cursor) {
     } else if (kind == CXCursor_DeclRefExpr) {
         visitDeclRef(cursor);
     } else {
-        for(auto child : getChildren(cursor)) {
+        for (auto child : getChildren(cursor)) {
             visit(child);
         }
     }
 }
 
-CXChildVisitResult visitor(CXCursor cursor, CXCursor parent, CXClientData clientData) {
+CXChildVisitResult printVisitor(CXCursor cursor, CXCursor parent, CXClientData clientData) {
     int depth = *(int*)clientData;
     int nextDepth = depth + 1;
 
     std::cout << std::string(depth, '-') << cursor << std::endl;
 
-    clang_visitChildren(cursor, visitor, &nextDepth);
+    clang_visitChildren(cursor, printVisitor, &nextDepth);
 
     return CXChildVisit_Continue;
 }
 
 void setupAsm() {
     emit(".org " + std::to_string(stackBegin));
-    emit("STACK: .dw " + std::to_string(stackSize/4));
+    emit("STACK: .dw " + std::to_string(stackSize / 4));
     emit(".org 0");
     emit("la r" + rsp + ", STACK");
-    emit("la r" + rret + ", func1");  // Entry point
+    emit("la r" + rret + ", END ; main exit");
+    push(stoi(rret));
+    emit("la r" + rret + ", func6 ; main entry");  // TODO search symtab for main
     emit("br r" + rret);
 
     symTab["unused1"];  // Start register allocation at 3
@@ -339,17 +470,28 @@ auto main(int argc, const char** argv) -> int {
         return 1;
     }
 
-
     CXCursor rootCursor = clang_getTranslationUnitCursor(translationUnit);
 
-    int startingDepth = 0;
+    if (argc > 1) {
+        std::string arg = argv[1];
+        if (arg == "-ast") {
+            int startingDepth = 0;
+            clang_visitChildren(rootCursor, printVisitor, &startingDepth);
+            return 0;
+        } else {
+            std::cerr << "Usage: " << argv[0] << " [-ast]" << std::endl;
+            return 1;
+        }
+    }
 
     setupAsm();
 
-    // clang_visitChildren(rootCursor, visitor, &startingDepth);
     visit(rootCursor);
 
     emit("stop");
+    emit("la r" + rret + ", END");
+    emit("END:");
+    emit("br r" + rret);  // End in infinite loop
 
     clang_disposeTranslationUnit(translationUnit);
     clang_disposeIndex(index);

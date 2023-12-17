@@ -2,11 +2,31 @@ int sum(int x, int y) {
 	return x + y;
 }
 
+int sub(int x, int y) {
+	return x - y;
+}
+
+int neg(int x) {
+	return -x;
+}
+
+int or(int x, int y) {
+	return x | y;
+}
+
+int not(int x) {
+	return ~x;
+}
+
+int and(int x, int y) {
+	return x & y;
+}
+
 int main() {
 	int a;
 	int b, c;
-	a = 99;
-	b = 88;
+	a = 31;
+	b = 400;
 	c = sum(a,b);
 	return c;
 }
